@@ -1,0 +1,17 @@
+# build artifacts
+prefix/
+src/
+dist/
+*.tar.xz
+SHA256SUMS
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

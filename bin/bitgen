@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""FPGAbitgen — one-command bitstream builder for Xilinx 7-series boards.
+
+Native open-source flow bundled next to this script:
+  GHDL + Yosys -> nextpnr -> fpga-as
+No Vivado required. Positions itself as a convenient CLI analog of Vivado's
+bitstream generation for common dev boards (see share/boards.json).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+APP = Path(__file__).resolve().parents[1]
+TOP_DEFAULT = "board_top"
+MIN_PY = (3, 8)
+
+# die aliases: smaller devices are the same silicon as bigger ones
+PART_ALIASES = {
+    "xc7a35t": "xc7a50t",
+    "xc7z007s": "xc7z010",
+    "xc7z012s": "xc7z010",
+    "xc7z014s": "xc7z010",
+}
+FAMILIES = (("xc7a", "artix7"), ("xc7k", "kintex7"),
+            ("xc7s", "spartan7"), ("xc7z", "zynq7"))
+
+
+class BuildError(RuntimeError):
+    pass
+
+
+def app(*parts: str) -> Path:
+    return APP.joinpath(*parts)
+
+
+def log(kind: str, text: str, quiet: bool) -> None:
+    if quiet and kind == "log":
+        return
+    if kind == "step":
+        print(f"--- {text}", flush=True)
+    elif kind == "done":
+        print(f"=== {text}", flush=True)
+    else:
+        print(text, flush=True)
+
+
+def run(step: str, argv: list[str], *, cwd: Path, env: dict, quiet: bool) -> None:
+    log("step", step, quiet)
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in proc.stdout:
+        log("log", line.rstrip(), quiet)
+    proc.wait()
+    if proc.returncode != 0:
+        raise BuildError(f"{step}: exit code {proc.returncode}")
+
+
+def device_of(part: str) -> str:
+    """xc7a35tcpg236-1 -> xc7a35t (the die device name)."""
+    m = re.match(r"^(xc7[a-z]?[0-9]+t)", part)
+    return m.group(1) if m else part
+
+
+def die_of(part: str) -> str:
+    dev = device_of(part)
+    return PART_ALIASES.get(dev, dev)
+
+
+def family_of(die: str) -> str:
+    for prefix, family in FAMILIES:
+        if die.startswith(prefix):
+            return family
+    raise BuildError(f"неизвестное семейство для {die}")
+
+
+def load_boards() -> dict:
+    j = app("share", "boards.json")
+    if j.exists():
+        return json.loads(j.read_text(encoding="utf-8"))
+    return {}
+
+
+def resolve_target(args) -> dict:
+    """Merge --board defaults with explicit flags -> part/xdc/loader."""
+    boards = load_boards()
+    board = args.board
+    if board and board not in boards:
+        raise BuildError(f"плата '{board}' неизвестна. Доступны: {', '.join(sorted(boards))}")
+    b = boards.get(board, {})
+    part = args.part or b.get("part")
+    if not part:
+        raise BuildError("укажите --part (например xc7a35tcpg236-1) или --board")
+    xdc = Path(args.xdc) if args.xdc else (
+        app("share", "boards", b["xdc"]) if b.get("xdc") else None)
+    if not xdc:
+        raise BuildError("укажите --xdc (констрейн-файл платы)")
+    if not xdc.exists():
+        raise BuildError(f"констрейн не найден: {xdc}")
+    return {"part": part, "xdc": xdc, "loader": args.loader or b.get("loader")}
+
+
+def tool_env(tools: Path) -> dict:
+    env = os.environ.copy()
+    env["GHDL_PREFIX"] = str(tools / "lib/ghdl")
+    env["NEXTPNR_HIMBAECHEL_BIN"] = str(tools / "bin/nextpnr-himbaechel")
+    return env
+
+
+def prepare_xdc(xdc: Path, work: Path) -> Path:
+    # the Vivado-only DRC hint line is not parseable by the nextpnr XDC reader
+    lines = xdc.read_text(encoding="utf-8", errors="replace").splitlines()
+    out = work / "design.xdc"
+    out.write_text("\n".join(ln for ln in lines if "get_drc_checks" not in ln) + "\n",
+                   encoding="utf-8")
+    return out
+
+
+def chipdb_for(part: str, tools: Path) -> Path:
+    # the shim derives --device from the file name, so the file must be named
+    # after the part (package included), not the bare die
+    dbpart = re.sub(r"-\d+$", "", part)
+    die = die_of(part)
+    for cand in (app("share", "chipdb", f"chipdb-{dbpart}.bin"),
+                 app("share", "chipdb", f"chipdb-{die}.bin")):
+        if cand.exists():
+            return cand
+    available = sorted(p.name for p in app("share", "chipdb").glob("chipdb-*.bin"))
+    raise BuildError(
+        f"chipdb для {part} не найдена.\n"
+        f"Доступны: {', '.join(available) or 'нет'}\n"
+        f"Пересоберите: ./build.sh --parts {part}")
+
+
+def db_part_dir(tools: Path, part: str, family: str) -> Path:
+    """Exact part dir in prjxray-db; fall back to speed grade -1."""
+    root = tools / "share" / "prjxray-db" / family
+    exact = root / part
+    if exact.exists():
+        return root
+    fallback = re.sub(r"-\d+$", "-1", part)
+    if (root / fallback).exists():
+        print(f"ВНИМАНИЕ: {part} отсутствует в базе, использую {fallback} "
+              f"(кадры идентичны, IDCODE может отличаться при прошивке)")
+        return root
+    raise BuildError(f"part {part} отсутствует в prjxray-db ({family})")
+
+
+def build(design: Path, out_bit: Path, target: dict, top: str,
+          workdir: Path | None, keep: bool, quiet: bool) -> Path:
+    tools = app("tools")
+    for p in (tools / "libexec/yosys", tools / "libexec/ghdl",
+              tools / "bin/nextpnr-xilinx", tools / "bin/fpga-as"):
+        if not p.exists():
+            raise BuildError(f"бандл неполон: нет {p.relative_to(APP)}\nЗапустите ./build.sh")
+    part = target["part"]
+    die = die_of(part)
+    family = family_of(die)
+    chipdb = chipdb_for(part, tools)
+    db_part = db_part_dir(tools, part, family)
+    env = tool_env(tools)
+
+    work = Path(workdir).resolve() if workdir else Path(tempfile.mkdtemp(prefix="bitgen_"))
+    if workdir is None and work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+
+    design = design.resolve()
+    out_bit = out_bit.resolve()
+    netlist = work / "design.json"
+    fasm = work / "design.fasm"
+    raw = work / "design.bit"
+
+    run("GHDL: analysis", [str(tools / "libexec/ghdl"), "-a", str(design)],
+        cwd=work, env=env, quiet=quiet)
+
+    run("Yosys: synthesis (ghdl -> xc7)",
+        [str(tools / "libexec/yosys"),
+         "-m", str(tools / "share/yosys/plugins/ghdl.so"),
+         "-p", f"ghdl {design} -e {top}; "
+               f"synth_xilinx -flatten -abc9 -arch xc7 -top {top}; "
+               f"write_json {netlist}"],
+        cwd=work, env=env, quiet=quiet)
+
+    run(f"nextpnr: place & route ({part}, die {die})",
+        [str(tools / "bin/nextpnr-xilinx"), "--chipdb", str(chipdb),
+         "--xdc", str(prepare_xdc(target["xdc"], work)),
+         "--json", str(netlist), "--fasm", str(fasm)],
+        cwd=work, env=env, quiet=quiet)
+
+    log("step", "fpga-as: bitstream assembly", quiet)
+    with raw.open("wb") as bitfile:
+        proc = subprocess.run(
+            [str(tools / "bin/fpga-as"),
+             f"--prjxray_db_path={tools / 'share/prjxray-db'}/{family}",
+             f"--part={part}", str(fasm)],
+            stdout=bitfile, stderr=subprocess.PIPE, cwd=work, env=env)
+    err = proc.stderr.decode(errors="replace").strip()
+    if proc.returncode != 0 or not raw.exists() or raw.stat().st_size == 0:
+        raise BuildError(f"fpga-as failed\n{err[-600:]}")
+    log("log", f"bitstream: {raw.stat().st_size} bytes", quiet)
+
+    out_bit.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(raw, out_bit)
+    if workdir is None and not keep:
+        shutil.rmtree(work, ignore_errors=True)
+    elif keep:
+        log("log", f"workdir kept: {work}", quiet)
+    return out_bit
+
+
+def flash(bit: Path, loader_board: str | None, quiet: bool) -> None:
+    if not loader_board:
+        raise BuildError("для --flash укажите --loader <имя> (openFPGALoader) или --board")
+    loader = shutil.which("openFPGALoader")
+    if not loader:
+        raise BuildError("openFPGALoader не найден в PATH (brew install openfpgaloader)")
+    run(f"Прошивка платы ({bit}, board {loader_board})",
+        [loader, "-b", loader_board, str(bit)],
+        cwd=Path.home(), env=os.environ.copy(), quiet=quiet)
+
+
+def main(argv: list[str]) -> int:
+    if sys.version_info < MIN_PY:
+        print(f"нужен python >= {MIN_PY[0]}.{MIN_PY[1]}", file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(
+        prog="bitgen",
+        description="FPGAbitgen: VHDL/Verilog -> битстрим для плат Xilinx 7-series, "
+                    "нативный аналог Vivado bitstream generation (без Vivado)")
+    ap.add_argument("design", nargs="?", help="VHDL-файл (top по умолчанию board_top)")
+    ap.add_argument("-o", "--output")
+    ap.add_argument("--board", help="плата из share/boards.json "
+                 "(задаёт part, xdc и имя для прошивки)")
+    ap.add_argument("--part", help="чип целиком, например xc7a35tcpg236-1")
+    ap.add_argument("--xdc", help="констрейн-файл платы")
+    ap.add_argument("--loader", help="имя платы для openFPGALoader (basys3, arty, ...)")
+    ap.add_argument("--top", default=TOP_DEFAULT)
+    ap.add_argument("--workdir")
+    ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--flash", action="store_true")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--boards", action="store_true", help="показать список плат и выйти")
+    ap.add_argument("--version", action="version",
+                    version=(app("share/VERSION").read_text().strip()
+                             if app("share/VERSION").exists() else "dev"))
+    args = ap.parse_args(argv)
+
+    if args.boards:
+        for name, b in sorted(load_boards().items()):
+            print(f"{name:12s} part={b.get('part','?'):20s} xdc={b.get('xdc','?')}")
+        return 0
+    if not args.design:
+        ap.error("укажите файл дизайна")
+
+    design = Path(args.design)
+    if not design.exists():
+        print(f"дизайн не найден: {design}", file=sys.stderr)
+        return 2
+    try:
+        target = resolve_target(args)
+    except BuildError as exc:
+        print(f"ОШИБКА: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.output) if args.output else design.with_suffix(".bit")
+
+    try:
+        result = build(design, out, target, args.top, args.workdir, args.keep, args.quiet)
+        log("done", f"Готово: {result}", args.quiet)
+        if args.flash:
+            flash(result, target.get("loader"), args.quiet)
+        return 0
+    except BuildError as exc:
+        print(f"\nОШИБКА: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,50 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, suite: "oss-cad-suite-darwin-arm64" }
+          - { os: ubuntu-24.04, suite: "oss-cad-suite-linux-x64" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # ghdl+yosys берём готовыми из OSS CAD Suite (сборка ghdl требует GNAT)
+      - name: Fetch OSS CAD Suite
+        run: |
+          VER=$(curl -fsSL https://api.github.com/repos/YosysHQ/oss-cad-suite-build/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+          curl -fsSL -o suite.tgz "https://github.com/YosysHQ/oss-cad-suite-build/releases/download/$VER/${{ matrix.suite }}-$VER.tgz"
+          tar -xzf suite.tgz -C "$HOME"
+          echo "BITGEN_SUITE=$HOME/oss-cad-suite" >> "$GITHUB_ENV"
+      - name: Install build deps
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            brew install cmake boost eigen python3 pypy3
+          else
+            sudo apt-get update
+            sudo apt-get install -y cmake libboost-all-dev libeigen3-dev \
+              python3 pypy3 bison flex libreadline-dev libffi-dev zlib1g-dev \
+              tcl-dev pkg-config xz-utils curl
+          fi
+      - name: Build
+        run: ./build.sh --dies "${BITGEN_DIES:-xc7a50t}"
+      - name: Smoke test
+        run: |
+          echo "-- smoke: driver runs"
+          ./prefix/bin/bitgen --version
+      - name: Package
+        run: ./package.sh ./prefix dist
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.xz
+            dist/SHA256SUMS

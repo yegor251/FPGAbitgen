@@ -1,0 +1,4 @@
+{
+  "basys3": {"part": "xc7a35tcpg236-1", "xdc": "basys3.xdc", "loader": "basys3"},
+  "arty":   {"part": "xc7a35tcsg324-1", "xdc": "arty.xdc",   "loader": "arty"}
+}
