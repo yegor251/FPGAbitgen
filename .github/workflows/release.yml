@@ -9,11 +9,12 @@ permissions:
 
 jobs:
   build:
+    # Linux-джоба пока не включена: бандлинг dylib работает через otool (macOS);
+    # для Linux нужен patchelf-вариант etc/bundle_dylibs.py
     strategy:
       matrix:
         include:
           - { os: macos-14, suite: "oss-cad-suite-darwin-arm64" }
-          - { os: ubuntu-24.04, suite: "oss-cad-suite-linux-x64" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
